@@ -1,0 +1,97 @@
+import streamlit as st
+import pandas as pd
+from ortools.sat.python import cp_model
+
+st.set_page_config(layout="wide", page_title="Hattı Dengeleme Sistemi")
+st.title("🏭 Komple Montaj Hattı Analiz Paneli")
+
+# --- Veri Seti ---
+t_raw = {
+    1: 2.43,  2: 9.79,  3: 2.12,  4: 9.92,  5: 4.66,  6: 11.58, 7: 1.01,  8: 1.44,  9: 9.66, 10: 10.30,
+    11: 0.49, 12: 7.13, 13: 7.18, 14: 2.44, 15: 3.58, 16: 4.90, 17: 3.21, 18: 7.78, 19: 11.27, 20: 11.35,
+    21: 0.80, 22: 3.31, 23: 9.83, 24: 0.80, 25: 4.61, 26: 5.20, 27: 11.89, 28: 6.30, 29: 13.32, 30: 0.98,
+    31: 14.20, 32: 6.13, 33: 0.98, 34: 14.49, 35: 3.14, 36: 12.12, 37: 1.07, 38: 5.14, 39: 5.63, 40: 0.57,
+    41: 10.13, 42: 0.90, 43: 1.39, 44: 1.43, 45: 0.51, 46: 10.74, 47: 5.65, 48: 7.38, 49: 1.71, 50: 15.09,
+    51: 7.31, 52: 6.93, 53: 10.72, 54: 1.31, 55: 6.45, 56: 2.39, 57: 0.89, 58: 11.06, 59: 8.02, 60: 6.48,
+    61: 3.13, 62: 0.53, 63: 7.74
+}
+I, J, SCALE = range(1, 64), range(1, 37), 100
+t = {i: int(round(t_raw[i] * SCALE)) for i in t_raw}
+P = [(i, i + 1) for i in range(1, 63)]
+BIG_M = sum(t.values())
+
+with st.sidebar:
+    st.header("⚙️ Ayarlar")
+    D_target = st.number_input("Hedef Üretim", value=32)
+    T_shift = st.number_input("Vardiya (dk)", value=510)
+    L_limit = st.number_input("Maks. Yürüme (L)", value=4)
+    solve_time = st.slider("Hız (sn)", 2, 20, 5)
+
+def run_optimization(target_w):
+    model = cp_model.CpModel()
+    x = {(i, j): model.NewBoolVar(f'x_{i}_{j}') for i in I for j in J}
+    y = {(w, j): model.NewBoolVar(f'y_{w}_{j}') for w in J for j in J}
+    z = {w: model.NewBoolVar(f'z_{w}') for w in J}
+    s = {j: model.NewBoolVar(f's_{j}') for j in J}
+    l = {j: model.NewIntVar(0, BIG_M, f'l_{j}') for j in J}
+    q = {(w, j): model.NewIntVar(0, BIG_M, f'q_{w}_{j}') for w in J for j in J}
+    C = model.NewIntVar(0, BIG_M, 'C')
+
+    for i in I: model.Add(sum(x[i, j] for j in J) == 1)
+    for i, h in P: model.Add(sum(j * x[i, j] for j in J) <= sum(j * x[h, j] for j in J))
+    for j in J: model.Add(l[j] == sum(t[i] * x[i, j] for i in I))
+    for j in J: model.Add(sum(y[w, j] for w in J) == s[j])
+    model.Add(sum(z[w] for w in J) == target_w)
+
+    for w in J:
+        for j in J:
+            model.Add(q[w, j] <= l[j])
+            model.Add(q[w, j] >= l[j] - BIG_M * (1 - y[w, j]))
+            model.Add(q[w, j] <= BIG_M * y[w, j])
+        model.Add(sum(q[w, j] for j in J) <= C)
+
+    model.Minimize(C)
+    solver = cp_model.CpSolver()
+    solver.parameters.max_time_in_seconds = float(solve_time)
+    status = solver.Solve(model)
+
+    if status in [cp_model.OPTIMAL, cp_model.FEASIBLE]:
+        c_min = solver.Value(C) / SCALE
+        res = {
+            "C": f"{c_min:.2f} dk",
+            "Op": target_w,
+            "Ist": sum(1 for j in J if solver.Value(s[j]) > 0.5),
+            "Cap": f"{(T_shift / c_min):.2f} Adet",
+            "Goal": "Evet" if (T_shift / c_min) >= D_target - 0.1 else "Hayır",
+            "Details": []
+        }
+        for j in J:
+            ops = [i for i in I if solver.Value(x[i, j]) > 0.5]
+            if ops:
+                res["Details"].append({"İstasyon": j, "Operasyonlar": str(ops), "Yük": f"{(solver.Value(l[j])/SCALE):.2f} dk"})
+        return res
+    return None
+
+if st.button("🚀 1-36 Senaryolarını Hesapla"):
+    all_results = []
+    progress = st.progress(0)
+    for w in range(1, 37):
+        r = run_optimization(w)
+        if r: all_results.append(r)
+        else: all_results.append({"C":"Yok", "Op":w, "Ist":"-", "Cap":"-", "Goal":"Hayır", "Details":[]})
+        progress.progress(w/36)
+
+    df = pd.DataFrame(all_results).drop(columns=['Details'])
+    st.subheader("📊 Senaryo Analiz Özet Tablosu")
+    
+    # Hata veren applymap yerine map kullanıldı
+    def style_goal(val):
+        return 'background-color: #d4edda' if val == "Evet" else 'background-color: #f8d7da'
+    
+    st.dataframe(df.style.map(style_goal, subset=['Goal']), use_container_width=True)
+
+    st.divider()
+    st.subheader("📋 Seçili Senaryo Detayları (Örn: En Verimli)")
+    best_r = next((x for x in reversed(all_results) if x["Goal"] == "Evet"), all_results[-1])
+    st.write(f"**Operatör Sayısı:** {best_r['Op']} | **Kapasite:** {best_r['Cap']}")
+    st.table(pd.DataFrame(best_r["Details"]))
